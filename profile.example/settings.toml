@@ -1,0 +1,73 @@
+# Job bot profile. Copy this folder to `profile/` and edit it. Git ignores `profile/`.
+# This example searches Berlin for go-to-market (GTM), revenue operations and AI automation roles.
+
+# Job emails go only to this address, from the Gmail account you approve with `python -m jobbot auth`.
+owner_email = "you@example.com"
+timezone = "Europe/Berlin"
+# Runs only between these hours in your timezone: the start is included, the end is not.
+active_hours = [7, 21]
+
+[search]
+# A job must mention one of these places, or be remote, to be checked.
+locations = ["Berlin"]
+# A remote job from a company careers feed counts only if its location mentions one of these regions.
+# Short codes are matched as whole words.
+remote_regions = ["germany", "deutschland", "europe", "emea", "dach", "eu", "de"]
+max_job_age_hours = 48
+# Regular expressions matched against job titles, ignoring case. Keep them broad: the AI check narrows them.
+title_patterns = [
+  '\bgtm\b',
+  'go[\s-]to[\s-]market',
+  '\brev\s?ops\b',
+  'revenue[\s-]operations?',
+  '\bsales[\s-]op(?:eration)?s\b',
+  '\b(?:ai|ki|llm)\b[\s/&-]*(?:and\s+|&\s*)?(?:automation|automatisierung|enablement|transformation|operations|ops|adoption|solutions?)',
+  '\b(?:crm|workflow|process|prozess|business|marketing|sales)\b[\s/&-]*(?:and\s+|&\s*)?automation',
+  '(?:ki|prozess)[\s-]?automatisierung',
+  '\bautomation\s+(?:engineer|specialist|manager|lead|architect|consultant)',
+  '\bki[\s-]manager',
+  '\bcrm\b.*\b(?:engineer|architect|developer)\b',
+  'business[\s-]systems?',
+  'internal[\s-]tools?',
+  'forward[\s-]deployed',
+]
+excluded_title_patterns = [
+  'werkstudent', 'working\s+student', 'praktik', '\binternship\b', '\bintern\b', 'ausbildung', '\btrainee\b',
+  'duales?\s+studium', '\btest\s+automation\b', '\bqa\b', '\bsps\b', '\bplc\b', 'industrial\s+automation',
+  'automatisierungstechnik',
+]
+# Companies to skip, for example ones you are already talking to.
+excluded_companies = []
+
+[limits]
+# Each limit is checked against what the AI reads in the posting. Delete a line to switch that limit off.
+# Reject jobs that require this language above a basic level.
+language = "German"
+max_on_site_days = 4
+# Reject jobs whose stated salary range tops out below this, per year.
+min_salary = 60000
+salary_currency = "EUR"
+
+[sources]
+# Arbeitnow lists jobs across Germany. Berlin Startup Jobs covers Berlin only.
+arbeitnow = true
+berlin_startup_jobs = true
+# Read job alert emails from LinkedIn, Indeed, StepStone and XING in your Gmail.
+gmail_alerts = true
+# Public careers feeds of the companies in this file. Remove the line to switch it off.
+companies_file = "config/companies-berlin.csv"
+
+[sources.jsearch]
+# Google for Jobs through the JSearch API. Needs JSEARCH_API_KEY in .env. The free tier allows a few searches a day.
+country = "de"
+run_hours = [8, 16]
+queries = [
+  "GTM Engineer in Berlin",
+  "Go-to-Market Engineer in Berlin",
+  "Revenue Operations in Berlin",
+  "RevOps in Berlin",
+  "AI Automation Engineer in Berlin",
+  "CRM Automation in Berlin",
+  "AI Enablement in Berlin",
+  "Prozessautomatisierung KI in Berlin",
+]
