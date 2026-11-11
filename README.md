@@ -28,6 +28,7 @@ flowchart TD
 4. **Fit check.** The AI reads the posting and your target role document, and returns a decision, a fit score, reasons, gaps and unknowns.
 5. **Hard limits.** Code, not the AI, enforces your limits on what the AI extracted, such as a language requirement or a salary floor.
 6. **Notify and track.** Matches are emailed to you and appear in the web app, where you mark each one applied, interviewing, rejected or not interested.
+7. **Follow replies.** For jobs you marked applied, the bot reads employer emails that mention those companies, and moves each job to interviewing or rejected when a reply says so. It emails you a summary of every change, and adds a dated note to the job.
 
 ## Boundaries
 

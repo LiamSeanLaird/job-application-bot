@@ -38,6 +38,8 @@ CREATE INDEX IF NOT EXISTS jobs_dedupe_key ON jobs(dedupe_key);
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS gmail_messages (message_id TEXT PRIMARY KEY, processed_at TEXT NOT NULL);
+-- Employer emails already checked for interview invitations and rejections.
+CREATE TABLE IF NOT EXISTS status_emails (message_id TEXT PRIMARY KEY, processed_at TEXT NOT NULL);
 """
 
 NEW = "new"
@@ -253,6 +255,15 @@ class Store:
             "SELECT 1 FROM gmail_messages WHERE message_id = ?", (message_id,)
         ).fetchone()
         return row is not None
+
+    def is_status_email_processed(self, message_id: str) -> bool:
+        return self.connection.execute("SELECT 1 FROM status_emails WHERE message_id = ?", (message_id,)).fetchone() is not None
+
+    def mark_status_email_processed(self, message_id: str) -> None:
+        self.connection.execute(
+            "INSERT OR IGNORE INTO status_emails (message_id, processed_at) VALUES (?, ?)", (message_id, utc_now())
+        )
+        self.connection.commit()
 
     def mark_message_processed(self, message_id: str) -> None:
         self.connection.execute(

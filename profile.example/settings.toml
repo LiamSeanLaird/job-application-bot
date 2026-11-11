@@ -6,6 +6,9 @@ owner_email = "you@example.com"
 timezone = "Europe/Berlin"
 # Runs only between these hours in your timezone: the start is included, the end is not.
 active_hours = [7, 21]
+# Read employers' replies in Gmail, and move applied jobs to interviewing or rejected.
+# Only emails that mention a company you applied to are read.
+track_application_emails = true
 
 [search]
 # A job must mention one of these places, or be remote, to be checked.

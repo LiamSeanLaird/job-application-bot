@@ -138,6 +138,24 @@ def build_digest(jobs: list[dict], app_url: str | None, source_errors: list[str]
     return subject, "\n\n".join(text_parts), html
 
 
+def build_status_update(changes: list[dict], app_url: str) -> tuple[str, str, str]:
+    """A short email listing applications whose status changed after an employer email."""
+    count = len(changes)
+    subject = f"[Job Bot] {count} application{'' if count == 1 else 's'} updated"
+    lines = [f"{change['job']['title'].strip()} at {change['job']['company']}: {change['status']}" for change in changes]
+    items = "".join(
+        f"<li><b>{escape(change['job']['title'].strip())}</b> at {escape(change['job']['company'])}: "
+        f"{escape(change['status'])}<br><span style=\"color:{MUTED};font-size:13px\">Email: {escape(change['subject'])}</span></li>"
+        for change in changes
+    )
+    html = (
+        f'<div style="font-family:{FONT};color:{INK};max-width:600px">'
+        f"<p>These applications changed status after an employer email:</p><ul>{items}</ul>"
+        f'<p><a href="{escape(app_url, quote=True)}">Open job tracker</a></p></div>'
+    )
+    return subject, "\n".join(lines + [f"Job tracker: {app_url}"]), html
+
+
 def build_source_warning(source: str, failures: int, error: str) -> tuple[str, str, str]:
     subject = f"[Job Bot] {source} has failed {failures} times in a row"
     body = f"{source} has failed {failures} runs in a row. You may be missing jobs from it.\n\nLast error: {error}"

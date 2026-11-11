@@ -10,15 +10,17 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
 
-from jobbot import pipeline, web
+from jobbot import application_emails, notify, pipeline, web
 from jobbot.ai import OpenAIClient
 from jobbot.config import (
     ACTIVE_HOURS,
+    APP_URL,
     ARBEITNOW_ENABLED,
     BERLIN_STARTUP_JOBS_ENABLED,
     DATA_DIR,
     DATABASE,
     GMAIL_ALERTS_ENABLED,
+    TRACK_APPLICATION_EMAILS,
     JSEARCH_QUERIES,
     LOG_FILE,
     TARGET_ROLE_FILE,
@@ -109,7 +111,19 @@ def run(force: bool, backfill_hours: int | None = None) -> int:
             return found
         sources["jsearch"] = fetch_jsearch
     pipeline.run_once(sources, store, ai, gmail, target_role)
+    if TRACK_APPLICATION_EMAILS:
+        update_application_statuses(gmail, ai, store)
     return 0
+
+
+def update_application_statuses(gmail, ai, store: Store) -> None:
+    """Never stops the run: a failure here is logged and retried next time."""
+    try:
+        changes = application_emails.update_from_emails(gmail, ai, store)
+        if changes:
+            gmail.send_to_owner(*notify.build_status_update(changes, APP_URL))
+    except Exception as error:
+        logging.warning("Could not update statuses from emails: %s", error)
 
 
 def main() -> int:

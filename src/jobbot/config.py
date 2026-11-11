@@ -86,6 +86,7 @@ SALARY_CURRENCY: str = _limits.get("salary_currency", "EUR")
 ARBEITNOW_ENABLED: bool = _sources.get("arbeitnow", False)
 BERLIN_STARTUP_JOBS_ENABLED: bool = _sources.get("berlin_startup_jobs", False)
 GMAIL_ALERTS_ENABLED: bool = _sources.get("gmail_alerts", False)
+TRACK_APPLICATION_EMAILS: bool = _profile.get("track_application_emails", False)
 COMPANIES_FILE: Path | None = REPO_ROOT / _sources["companies_file"] if _sources.get("companies_file") else None
 JSEARCH_QUERIES: list[str] = _jsearch.get("queries", [])
 JSEARCH_COUNTRY: str = _jsearch.get("country", "")

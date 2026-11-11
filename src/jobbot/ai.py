@@ -198,6 +198,34 @@ class OpenAIClient:
         user = f"<page>\n{page_text[:MAX_JOB_TEXT_CHARS]}\n</page>"
         return self.structured(system, user, "job_posting", POSTING_SCHEMA)
 
+    def classify_application_email(self, message: dict, jobs: list[dict]) -> dict:
+        """Decide whether an email is an interview invitation or a rejection for one of the owner's applications."""
+        ids = [job["job_id"] for job in jobs]
+        schema = {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "enum": ids + ["none"]},
+                "outcome": {"type": "string", "enum": ["interview", "rejection", "other"]},
+            },
+            "required": ["job_id", "outcome"],
+            "additionalProperties": False,
+        }
+        system = (
+            "The candidate applied to the jobs listed below. Decide whether this email is a reply about one of those "
+            "applications, and what it says. 'interview' means the employer invites the candidate to an interview, call, "
+            "assessment or next round. 'rejection' means the employer, or a job site on its behalf, declines the "
+            "application. Everything else is 'other', including application confirmations, newsletters, job alerts and "
+            "recruiter outreach about different roles. Choose job_id 'none' unless the email clearly concerns one listed "
+            "application. When the company has several listed jobs, pick the one the email names, or 'none' if unclear. "
+            f"{UNTRUSTED_NOTE}"
+        )
+        listing = "\n".join(f"{job['job_id']}: {job['title']} at {job['company']}" for job in jobs)
+        user = (
+            f"<applications>\n{listing}\n</applications>\n<email>\nFrom: {message['from']}\nSubject: {message['subject']}\n"
+            f"{message['text'][:MAX_JOB_TEXT_CHARS]}\n</email>"
+        )
+        return self.structured(system, user, "application_email", schema)
+
     def extract_alert_jobs(self, email_text: str) -> list[dict]:
         system = (
             "Extract every individual job advertised in this job alert email. "

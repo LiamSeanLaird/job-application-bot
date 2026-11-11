@@ -16,7 +16,7 @@ import requests
 os.environ["JOBBOT_PROFILE"] = str(Path(__file__).resolve().parents[1] / "profile.example")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from jobbot import filters, notify, pipeline, web  # noqa: E402
+from jobbot import application_emails, filters, notify, pipeline, web  # noqa: E402
 from jobbot import store as store_module  # noqa: E402
 from jobbot.ai import AIError, OpenAIClient  # noqa: E402
 from jobbot.cli import within_active_hours  # noqa: E402
@@ -797,6 +797,103 @@ class TrackManualJobTest(unittest.TestCase):
         job_id, _ = pipeline.track_manual_job(make_job(source="manual"), self.store, FakeAI(error=AIError("down")), "role")
         row = self.store.get(job_id)
         self.assertEqual((row["status"], row["fit_score"]), (MATCHED, None))
+
+
+class InboxGmail:
+    """Gmail with a fixed inbox, newest first like the real search."""
+
+    def __init__(self, messages):
+        self.messages = messages
+        self.queries = []
+        self.reads = []
+        self.sent = []
+
+    def search(self, query, max_results=50):
+        self.queries.append(query)
+        return list(self.messages)
+
+    def read(self, message_id):
+        self.reads.append(message_id)
+        return self.messages[message_id]
+
+    def send_to_owner(self, subject, text, html):
+        self.sent.append(subject)
+
+
+class ReplyAI:
+    def __init__(self, answers, error=None):
+        self.answers = answers
+        self.error = error
+
+    def classify_application_email(self, message, jobs):
+        if self.error:
+            raise self.error
+        return self.answers[message["subject"]]
+
+
+def email(subject, day=10):
+    return {"from": "jobs@acme.test", "subject": subject, "text": "Hello", "received_at": datetime(2026, 11, day, 9, tzinfo=timezone.utc)}
+
+
+class ApplicationEmailTest(unittest.TestCase):
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.store.add(make_job(company="Siemens Energy Global GmbH & Co. KG"))
+        self.store.save_assessment("arbeitnow:1", assessment(), None)
+        self.store.set_application_status("arbeitnow:1", "applied")
+
+    def run_update(self, messages, answers, error=None):
+        gmail = InboxGmail(messages)
+        return application_emails.update_from_emails(gmail, ReplyAI(answers, error), self.store), gmail
+
+    def test_company_names_are_shortened_to_how_emails_write_them(self):
+        names = [application_emails.search_name(name) for name in ("Siemens Energy Global GmbH & Co. KG", "imago stock & people GmbH", "AUTO1 Group")]
+        self.assertEqual(names, ["Siemens Energy", "imago", "AUTO1"])
+
+    def test_query_only_covers_applied_companies_since_applying(self):
+        _, gmail = self.run_update({}, {})
+        query = gmail.queries[0]
+        self.assertIn('"Siemens Energy"', query)
+        self.assertIn('-subject:"[Job Bot]"', query)
+        self.assertRegex(query, r"^after:\d{4}/\d{2}/\d{2} ")
+
+    def test_interview_then_rejection_ends_rejected_with_notes(self):
+        messages = {"m2": email("Unfortunately", day=12), "m1": email("Interview invitation", day=11)}
+        answers = {"Interview invitation": {"job_id": "arbeitnow:1", "outcome": "interview"}, "Unfortunately": {"job_id": "arbeitnow:1", "outcome": "rejection"}}
+        changes, _ = self.run_update(messages, answers)
+        job = self.store.get("arbeitnow:1")
+        self.assertEqual([change["status"] for change in changes], ["interviewing", "rejected"])
+        self.assertEqual(job["application_status"], "rejected")
+        self.assertIn('moved to interviewing after an email: "Interview invitation"', job["notes"])
+        self.assertIn('moved to rejected after an email: "Unfortunately"', job["notes"])
+
+    def test_status_never_moves_backwards(self):
+        self.store.set_application_status("arbeitnow:1", "interviewing")
+        changes, _ = self.run_update({"m1": email("Next round")}, {"Next round": {"job_id": "arbeitnow:1", "outcome": "interview"}})
+        self.assertEqual((changes, self.store.get("arbeitnow:1")["application_status"]), ([], "interviewing"))
+
+    def test_unrelated_email_changes_nothing_and_is_not_read_again(self):
+        changes, gmail = self.run_update({"m1": email("Newsletter")}, {"Newsletter": {"job_id": "none", "outcome": "other"}})
+        self.assertEqual((changes, self.store.get("arbeitnow:1")["application_status"]), ([], "applied"))
+        _, second = self.run_update({"m1": email("Newsletter")}, {})
+        self.assertEqual(second.reads, [])
+
+    def test_ai_failure_leaves_the_email_for_the_next_run(self):
+        self.run_update({"m1": email("Interview")}, {}, error=AIError("down"))
+        self.assertFalse(self.store.is_status_email_processed("m1"))
+        self.assertEqual(self.store.get("arbeitnow:1")["application_status"], "applied")
+
+    def test_jobs_still_to_review_are_not_tracked(self):
+        self.store.set_application_status("arbeitnow:1", "to review")
+        _, gmail = self.run_update({"m1": email("x")}, {})
+        self.assertEqual(gmail.queries, [])
+
+    def test_status_update_email_lists_changes(self):
+        changes = [{"job": self.store.get("arbeitnow:1"), "status": "rejected", "subject": "<b>Your application</b>"}]
+        subject, text, html = notify.build_status_update(changes, "https://tracker.test")
+        self.assertEqual(subject, "[Job Bot] 1 application updated")
+        self.assertIn("rejected", text)
+        self.assertNotIn("<b>Your application</b>", html)
 
 
 class StoreMigrationTest(unittest.TestCase):
