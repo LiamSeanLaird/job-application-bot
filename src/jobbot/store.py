@@ -56,6 +56,8 @@ ADDED_COLUMNS = {
     "notes": "TEXT NOT NULL DEFAULT ''",
     "status_changed_at": "TEXT",
     "posting_details": "TEXT NOT NULL DEFAULT '{}'",
+    # The job category the AI judged the job against, which decides the CV to send. Empty means the first track.
+    "track": "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -150,7 +152,7 @@ class Store:
     def save_assessment(self, job_id: str, assessment: dict, filter_reason: str | None) -> None:
         self.connection.execute(
             """UPDATE jobs SET status = ?, filter_reason = ?, fit_score = ?, reasons = ?, gaps = ?,
-                               unknowns = ?, assessed_at = ? WHERE job_id = ?""",
+                               unknowns = ?, assessed_at = ?, track = ? WHERE job_id = ?""",
             (
                 FILTERED_OUT if filter_reason else MATCHED,
                 filter_reason,
@@ -159,6 +161,7 @@ class Store:
                 json.dumps(assessment.get("gaps") or []),
                 json.dumps(assessment.get("unknowns") or []),
                 utc_now(),
+                assessment.get("track") or "",
                 job_id,
             ),
         )
@@ -195,6 +198,16 @@ class Store:
     def filtered_out(self, limit: int) -> list[dict]:
         rows = self.connection.execute(
             "SELECT * FROM jobs WHERE status = ? ORDER BY first_seen_at DESC LIMIT ?", (FILTERED_OUT, limit)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def search(self, text: str, limit: int) -> list[dict]:
+        """Jobs whose title or company contains the text, ignoring case: matches first, then filtered-out jobs."""
+        pattern = "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        rows = self.connection.execute(
+            "SELECT * FROM jobs WHERE status IN (?, ?) AND (title LIKE ? ESCAPE '\\' OR company LIKE ? ESCAPE '\\') "
+            "ORDER BY status = ?, first_seen_at DESC LIMIT ?",
+            (MATCHED, FILTERED_OUT, pattern, pattern, FILTERED_OUT, limit),
         ).fetchall()
         return [dict(row) for row in rows]
 

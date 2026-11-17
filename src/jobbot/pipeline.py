@@ -13,6 +13,7 @@ from jobbot.config import (
     APP_URL,
     ARBEITNOW_MIN_MINUTES_BETWEEN_FETCHES,
     CAREERS_MIN_MINUTES_BETWEEN_FETCHES,
+    TECHTREE_MIN_MINUTES_BETWEEN_FETCHES,
     JSEARCH_RUN_HOURS,
     LOCATIONS,
     MAX_AI_ASSESSMENTS_PER_RUN,
@@ -61,6 +62,10 @@ def arbeitnow_is_due(store: Store, now: datetime) -> bool:
 
 def careers_is_due(store: Store, now: datetime) -> bool:
     return _fetch_is_due(store, "careers_last_fetch", CAREERS_MIN_MINUTES_BETWEEN_FETCHES, now)
+
+
+def techtree_is_due(store: Store, now: datetime) -> bool:
+    return _fetch_is_due(store, "techtree_last_fetch", TECHTREE_MIN_MINUTES_BETWEEN_FETCHES, now)
 
 
 def jsearch_is_due(store: Store, now_local: datetime) -> bool:
@@ -156,7 +161,20 @@ def find_duplicate(job: dict, store: Store, ai) -> str | None:
     return None
 
 
-def assess_pending(store: Store, ai, target_role: str, summary: RunSummary) -> None:
+def candidate_roles(job: dict, target_roles: dict[str, str]) -> dict[str, str]:
+    """The tracks whose titles match this job. Jobs from pasted links or alerts may match none, so all are offered."""
+    keys = filters.matching_tracks(job["title"])
+    return {key: text for key, text in target_roles.items() if key in keys} or target_roles
+
+
+def assess(ai, job: dict, target_roles: dict[str, str]) -> dict:
+    assessment = ai.assess_job(job, candidate_roles(job, target_roles))
+    if assessment.get("track") not in target_roles:
+        assessment["track"] = next(iter(candidate_roles(job, target_roles)))
+    return assessment
+
+
+def assess_pending(store: Store, ai, target_roles: dict[str, str], summary: RunSummary) -> None:
     consecutive_failures = 0
     for job in store.pending(MAX_AI_ASSESSMENTS_PER_RUN):
         try:
@@ -165,7 +183,7 @@ def assess_pending(store: Store, ai, target_role: str, summary: RunSummary) -> N
                 store.mark_duplicate(job["job_id"], duplicate_of)
                 summary.duplicates += 1
                 continue
-            assessment = ai.assess_job(job, target_role)
+            assessment = assess(ai, job, target_roles)
         except AIError as error:
             consecutive_failures += 1
             log.warning("AI check failed for %s: %s", job["job_id"], error)
@@ -183,7 +201,7 @@ def assess_pending(store: Store, ai, target_role: str, summary: RunSummary) -> N
         summary.filtered_out += reason is not None
 
 
-def track_manual_job(job: Job, store: Store, ai, target_role: str) -> tuple[str, bool]:
+def track_manual_job(job: Job, store: Store, ai, target_roles: dict[str, str]) -> tuple[str, bool]:
     """Add a job the owner pasted. Returns its job ID and whether it was already tracked.
 
     A job already in the system, even under another link or as a repost, is reused rather than added twice.
@@ -208,7 +226,9 @@ def track_manual_job(job: Job, store: Store, ai, target_role: str) -> tuple[str,
             store.track(job_id, None, row["filter_reason"])
         else:
             try:
-                assessment = ai.assess_job(row, target_role)
+                assessment = ai.assess_job(row, target_roles)
+                if assessment.get("track") not in target_roles:
+                    assessment["track"] = next(iter(target_roles))
             except AIError as error:
                 log.warning("AI check failed for pasted job %s: %s", job_id, error)
                 store.track(job_id, None, "The AI check failed, so this job has no fit score.")
@@ -229,11 +249,11 @@ def send_digest(store: Store, gmail, summary: RunSummary) -> None:
     summary.notified = len(jobs)
 
 
-def run_once(sources, store: Store, ai, gmail, target_role: str, max_age_hours: int | None = None) -> RunSummary:
+def run_once(sources, store: Store, ai, gmail, target_roles: dict[str, str], max_age_hours: int | None = None) -> RunSummary:
     summary = RunSummary()
     jobs = collect(sources, store, gmail, summary)
     record_relevant(jobs, store, summary, max_age_hours)
-    assess_pending(store, ai, target_role, summary)
+    assess_pending(store, ai, target_roles, summary)
     send_digest(store, gmail, summary)
     store.set_meta("last_successful_run", utc_now())
     log.info("Run finished: %s", summary)

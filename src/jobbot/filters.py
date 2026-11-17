@@ -15,18 +15,36 @@ from jobbot.config import (
     MIN_SALARY,
     SALARY_CURRENCY,
     SOURCE_MAX_AGE_HOURS,
-    TITLE_PATTERNS,
+    TRACKS,
+    TRACKS_BY_KEY,
 )
 from jobbot.models import Job, normalize_company
 
-# Title patterns come from the profile. They are broad on purpose, and the AI check narrows them.
-TARGET_TITLE_RE = re.compile("|".join(f"(?:{pattern})" for pattern in TITLE_PATTERNS), re.IGNORECASE)
+# Title patterns come from each track in the profile. They are broad on purpose, and the AI check narrows them.
+TRACK_TITLE_RES = {
+    track.key: re.compile("|".join(f"(?:{pattern})" for pattern in track.title_patterns) or r"(?!x)x", re.IGNORECASE)
+    for track in TRACKS
+}
+TRACK_EXCLUDED_RES = {
+    track.key: re.compile("|".join(f"(?:{pattern})" for pattern in track.excluded_title_patterns) or r"(?!x)x", re.IGNORECASE)
+    for track in TRACKS
+}
 EXCLUDED_TITLE_RE = re.compile("|".join(f"(?:{pattern})" for pattern in EXCLUDED_TITLE_PATTERNS) or r"(?!x)x", re.IGNORECASE)
 EXCLUDED_COMPANIES = {normalize_company(name) for name in EXCLUDED_COMPANY_NAMES}
 
 
+def matching_tracks(title: str) -> list[str]:
+    """Keys of the tracks whose title patterns match, or none if the title is excluded."""
+    if EXCLUDED_TITLE_RE.search(title):
+        return []
+    return [
+        key for key, pattern in TRACK_TITLE_RES.items()
+        if pattern.search(title) and not TRACK_EXCLUDED_RES.get(key, EXCLUDED_TITLE_RE).search(title)
+    ]
+
+
 def is_target_title(title: str) -> bool:
-    return bool(TARGET_TITLE_RE.search(title)) and not EXCLUDED_TITLE_RE.search(title)
+    return bool(matching_tracks(title))
 
 
 def is_in_search_area(job: Job) -> bool:
@@ -59,7 +77,7 @@ def passes_rules(job: Job, now: datetime | None = None, max_age_hours: int | Non
     )
 
 
-def hard_requirement_failure(assessment: dict) -> str | None:
+def hard_requirement_failure(assessment: dict, track_key: str | None = None) -> str | None:
     """Enforce the profile's limits in code, using what the AI extracted from the posting."""
     if LANGUAGE_LIMIT and assessment.get("language_requirement") == "required":
         return f"Requires {LANGUAGE_LIMIT} above a basic level"
@@ -67,6 +85,8 @@ def hard_requirement_failure(assessment: dict) -> str | None:
     if MAX_ON_SITE_DAYS is not None and on_site_days is not None and on_site_days > MAX_ON_SITE_DAYS:
         return f"Requires {on_site_days} days on site"
     salary = assessment.get("salary_max_per_year")
-    if MIN_SALARY is not None and salary is not None and salary < MIN_SALARY:
+    track = TRACKS_BY_KEY.get(track_key or assessment.get("track") or "")
+    min_salary = track.min_salary if track and track.min_salary is not None else MIN_SALARY
+    if min_salary is not None and salary is not None and salary < min_salary:
         return f"Salary tops out at {SALARY_CURRENCY} {salary:,}"
     return None

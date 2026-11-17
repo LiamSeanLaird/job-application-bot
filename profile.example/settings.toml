@@ -4,8 +4,8 @@
 # Job emails go only to this address, from the Gmail account you approve with `python -m jobbot auth`.
 owner_email = "you@example.com"
 timezone = "Europe/Berlin"
-# Runs only between these hours in your timezone: the start is included, the end is not.
-active_hours = [7, 21]
+# The hours of the day, in your timezone, when the bot searches. Each run takes a few minutes.
+run_hours = [8, 13, 18]
 # Read employers' replies in Gmail, and move applied jobs to interviewing or rejected.
 # Only emails that mention a company you applied to are read.
 track_application_emails = true
@@ -17,23 +17,7 @@ locations = ["Berlin"]
 # Short codes are matched as whole words.
 remote_regions = ["germany", "deutschland", "europe", "emea", "dach", "eu", "de"]
 max_job_age_hours = 48
-# Regular expressions matched against job titles, ignoring case. Keep them broad: the AI check narrows them.
-title_patterns = [
-  '\bgtm\b',
-  'go[\s-]to[\s-]market',
-  '\brev\s?ops\b',
-  'revenue[\s-]operations?',
-  '\bsales[\s-]op(?:eration)?s\b',
-  '\b(?:ai|ki|llm)\b[\s/&-]*(?:and\s+|&\s*)?(?:automation|automatisierung|enablement|transformation|operations|ops|adoption|solutions?)',
-  '\b(?:crm|workflow|process|prozess|business|marketing|sales)\b[\s/&-]*(?:and\s+|&\s*)?automation',
-  '(?:ki|prozess)[\s-]?automatisierung',
-  '\bautomation\s+(?:engineer|specialist|manager|lead|architect|consultant)',
-  '\bki[\s-]manager',
-  '\bcrm\b.*\b(?:engineer|architect|developer)\b',
-  'business[\s-]systems?',
-  'internal[\s-]tools?',
-  'forward[\s-]deployed',
-]
+# Titles to skip for every track, as regular expressions matched ignoring case.
 excluded_title_patterns = [
   'werkstudent', 'working\s+student', 'praktik', '\binternship\b', '\bintern\b', 'ausbildung', '\btrainee\b',
   'duales?\s+studium', '\btest\s+automation\b', '\bqa\b', '\bsps\b', '\bplc\b', 'industrial\s+automation',
@@ -59,12 +43,45 @@ berlin_startup_jobs = true
 gmail_alerts = true
 # Public careers feeds of the companies in this file. Remove the line to switch it off.
 companies_file = "config/companies-berlin.csv"
+# TechTree (jobs.techtree.dev), a small curated job board. Read about every 2 hours. Check its terms before switching it on.
+techtree = false
 
 [sources.jsearch]
 # Google for Jobs through the JSearch API. Needs JSEARCH_API_KEY in .env. The free tier allows a few searches a day.
 country = "de"
 run_hours = [8, 16]
-queries = [
+# Search queries are set per track below.
+
+# Each track is a job category with its own titles, target role document and CV.
+# The AI checks every job against the tracks its title matches and picks the best one,
+# so the tracker shows which CV to send. Add another [[tracks]] block for a second category.
+[[tracks]]
+key = "gtm"
+# Shown in the tracker and emails as the CV to send, when there is more than one track.
+label = "GTM CV"
+target_role = "target_role.md"
+# Optional: a salary floor for this track only, overriding [limits] min_salary.
+# min_salary = 60000
+# Optional: titles to skip for this track only, for example seniority levels that are too high.
+# excluded_title_patterns = ['\bsenior\b', '\bstaff\b', '\bprincipal\b']
+# Regular expressions matched against job titles, ignoring case. Keep them broad: the AI check narrows them.
+title_patterns = [
+  '\bgtm\b',
+  'go[\s-]to[\s-]market',
+  '\brev\s?ops\b',
+  'revenue[\s-]operations?',
+  '\bsales[\s-]op(?:eration)?s\b',
+  '\b(?:ai|ki|llm)\b[\s/&-]*(?:and\s+|&\s*)?(?:automation|automatisierung|enablement|transformation|operations|ops|adoption|solutions?)',
+  '\b(?:crm|workflow|process|prozess|business|marketing|sales)\b[\s/&-]*(?:and\s+|&\s*)?automation',
+  '(?:ki|prozess)[\s-]?automatisierung',
+  '\bautomation\s+(?:engineer|specialist|manager|lead|architect|consultant)',
+  '\bki[\s-]manager',
+  '\bcrm\b.*\b(?:engineer|architect|developer)\b',
+  'business[\s-]systems?',
+  'internal[\s-]tools?',
+  'forward[\s-]deployed',
+]
+jsearch_queries = [
   "GTM Engineer in Berlin",
   "Go-to-Market Engineer in Berlin",
   "Revenue Operations in Berlin",

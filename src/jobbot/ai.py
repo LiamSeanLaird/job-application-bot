@@ -7,7 +7,9 @@ untrusted, and can only influence the values in that JSON.
 from __future__ import annotations
 
 import json
+import logging
 import time
+from collections import defaultdict
 
 import requests
 
@@ -100,21 +102,53 @@ class AIError(RuntimeError):
     pass
 
 
+USAGE_FIELDS = ("calls", "input", "cached", "output", "reasoning")
+
+
 class OpenAIClient:
     def __init__(self, api_key: str, model: str, session: requests.Session | None = None) -> None:
         self.api_key = api_key
         self.model = model
         self.session = session or requests.Session()
+        # Token counts per call type since this client was created, for the log.
+        self.usage: dict[str, dict[str, int]] = defaultdict(lambda: dict.fromkeys(USAGE_FIELDS, 0))
 
-    def structured(self, system: str, user: str, name: str, schema: dict) -> dict:
+    def structured(self, system: str, user: str, name: str, schema: dict, cache_key: str | None = None) -> dict:
+        """The fixed instructions come first and the job or email last, so OpenAI can reuse its cache of the
+        shared start. cache_key groups calls that share that start, which makes a cache hit more likely."""
         body = {
             "model": self.model,
             "reasoning": {"effort": "low"},
             "input": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "text": {"format": {"type": "json_schema", "name": name, "strict": True, "schema": schema}},
+            "prompt_cache_key": f"jobbot:{cache_key or name}",
         }
         response = self._post(body)
+        self._record_usage(name, response.get("usage") or {})
         return self._parse(response)
+
+    def _record_usage(self, name: str, usage: dict) -> None:
+        counts = {
+            "calls": 1,
+            "input": usage.get("input_tokens") or 0,
+            "cached": (usage.get("input_tokens_details") or {}).get("cached_tokens") or 0,
+            "output": usage.get("output_tokens") or 0,
+            "reasoning": (usage.get("output_tokens_details") or {}).get("reasoning_tokens") or 0,
+        }
+        for field, value in counts.items():
+            self.usage[name][field] += value
+        logging.info(
+            "AI %s: %d input tokens (%d cached), %d output tokens (%d reasoning)",
+            name, counts["input"], counts["cached"], counts["output"], counts["reasoning"],
+        )
+
+    def log_usage(self) -> None:
+        """One log line per call type with the totals so far."""
+        for name, counts in sorted(self.usage.items()):
+            logging.info(
+                "AI usage %s: %d calls, %d input tokens (%d cached), %d output tokens (%d reasoning)",
+                name, *(counts[field] for field in USAGE_FIELDS),
+            )
 
     def _post(self, body: dict) -> dict:
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -153,10 +187,18 @@ class OpenAIClient:
                         raise AIError("OpenAI returned invalid JSON") from error
         raise AIError("OpenAI response had no output text")
 
-    def assess_job(self, job: dict, target_role: str) -> dict:
+    def assess_job(self, job: dict, target_roles: dict[str, str]) -> dict:
+        """Check a job against each track's target role, and judge it against the track it fits best."""
+        tracks = list(target_roles)
+        schema = json.loads(json.dumps(ASSESSMENT_SCHEMA))
+        schema["properties"]["track"] = {"type": "string", "enum": tracks}
+        schema["required"] = ["track", *schema["required"]]
+        documents = "\n\n".join(f'<target_role track="{key}">\n{text}\n</target_role>' for key, text in target_roles.items())
         system = (
-            "You screen job postings for one candidate, using the target role document below. "
-            "Decide whether this job is worth applying to, following the screening rules in that document. "
+            "You screen job postings for one candidate. Below is one target role document for each job category "
+            "(track) the candidate is applying for, each with its own CV. First set track to the category this job fits "
+            "best. Then decide whether the job is worth applying to, following that track's document and screening rules, "
+            "and base the fit score, reasons and gaps on it. "
             f"Say no if the job cannot be done from {AREA}, for example a role tied to another country. "
             "A candidate gap does not by itself mean no. "
             "When only a title is available, judge the title, do not reject for missing information, and list what "
@@ -164,14 +206,14 @@ class OpenAIClient:
             f"language_requirement describes {LANGUAGE_LIMIT or 'the local language'}: 'required' only when the posting "
             "demands it above a basic level. "
             f"salary_max_per_year is the top of the stated yearly salary range in {SALARY_CURRENCY}, or null if not stated. "
-            f"{UNTRUSTED_NOTE}\n\n<target_role>\n{target_role}\n</target_role>"
+            f"{UNTRUSTED_NOTE}\n\n{documents}"
         )
         description = job["description"][:MAX_JOB_TEXT_CHARS] or "(No description available. Only the title is known.)"
         user = (
             f"<job_posting>\nTitle: {job['title']}\nCompany: {job['company']}\nLocation: {job['location']}\n"
             f"Remote: {bool(job['remote'])}\nDescription:\n{description}\n</job_posting>"
         )
-        return self.structured(system, user, "job_assessment", ASSESSMENT_SCHEMA)
+        return self.structured(system, user, "job_assessment", schema, cache_key=f"job_assessment:{'+'.join(tracks)}")
 
     def same_role(self, first: dict, second: dict) -> bool:
         system = (

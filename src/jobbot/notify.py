@@ -11,7 +11,7 @@ from html import escape
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-from jobbot.config import TIMEZONE
+from jobbot.config import TIMEZONE, TRACKS, TRACKS_BY_KEY
 
 SOURCE_NAMES = {
     "arbeitnow": "Arbeitnow",
@@ -27,6 +27,7 @@ SOURCE_NAMES = {
     "smartrecruiters": "Company site",
     "recruitee": "Company site",
     "personio": "Company site",
+    "techtree": "TechTree",
     "manual": "Added by you",
 }
 
@@ -58,6 +59,13 @@ def posted_label(posted_at: str, now: datetime) -> str:
     return f"{relative} ({posted.astimezone(local_zone):%-d %b})"
 
 
+def cv_label(job: dict) -> str:
+    """The CV to send, named after the job's track. Empty when the profile has only one track."""
+    if len(TRACKS) < 2:
+        return ""
+    return (TRACKS_BY_KEY.get(job.get("track") or "") or TRACKS[0]).label
+
+
 def _score_colors(score: int) -> tuple[str, str]:
     if score >= 80:
         return "#dcfce7", "#166534"
@@ -81,7 +89,7 @@ def _card(job: dict, now: datetime) -> str:
     link = _safe_link(job["url"])
     title = escape(job["title"].strip())
     title_html = f'<a href="{link}" style="color:{INK};text-decoration:none">{title}</a>' if link else title
-    details = [escape(part) for part in (job["location"], source_name(job["source"]), posted_label(job["posted_at"], now)) if part]
+    details = [escape(part) for part in (job["location"], source_name(job["source"]), posted_label(job["posted_at"], now), cv_label(job)) if part]
     others = _other_sites(job)
     also = (
         f'<div style="margin-top:6px;font-size:12px;color:{MUTED}">Also on '
@@ -110,7 +118,7 @@ def build_digest(jobs: list[dict], app_url: str | None, source_errors: list[str]
 
     text_parts = []
     for job in jobs:
-        details = " | ".join(part for part in (job["location"], source_name(job["source"]), posted_label(job["posted_at"], now)) if part)
+        details = " | ".join(part for part in (job["location"], source_name(job["source"]), posted_label(job["posted_at"], now), cv_label(job)) if part)
         text_parts.append(f"{job['fit_score']}  {job['title'].strip()} - {job['company']}\n    {details}\n    {job['url']}")
 
     footer = []

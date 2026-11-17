@@ -1,4 +1,5 @@
 import base64
+import re
 import os
 import json
 import sqlite3
@@ -19,12 +20,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from jobbot import application_emails, filters, notify, pipeline, web  # noqa: E402
 from jobbot import store as store_module  # noqa: E402
 from jobbot.ai import AIError, OpenAIClient  # noqa: E402
-from jobbot.cli import within_active_hours  # noqa: E402
+from jobbot.cli import is_run_hour  # noqa: E402
+from jobbot import config  # noqa: E402
 from jobbot.config import APP_URL, parse_env  # noqa: E402
 from jobbot.google_api import message_text  # noqa: E402
 from jobbot.models import Job, html_to_text, normalize_company, normalize_title  # noqa: E402
-from jobbot.sources import careers, gmail_alerts, jsearch, manual, public  # noqa: E402
+from jobbot.sources import careers, gmail_alerts, jsearch, manual, public, techtree  # noqa: E402
 from jobbot.store import DUPLICATE, FILTERED_OUT, MATCHED, NEW, Store  # noqa: E402
+
+
+ROLES = {"gtm": "role"}
 
 
 def make_job(native_id="1", title="GTM Engineer (m/w/d)", company="Acme GmbH", source="arbeitnow", **kwargs):
@@ -299,7 +304,7 @@ class PipelineTest(unittest.TestCase):
     def run_pipeline(self, jobs, ai=None, gmail=None):
         self.ai = ai or FakeAI()
         self.gmail = gmail or FakeGmail()
-        return pipeline.run_once({"test": lambda: jobs}, self.store, self.ai, self.gmail, "role")
+        return pipeline.run_once({"test": lambda: jobs}, self.store, self.ai, self.gmail, ROLES)
 
     def test_match_is_emailed_once_with_a_link_to_the_app(self):
         self.run_pipeline([make_job()])
@@ -381,7 +386,7 @@ class PipelineTest(unittest.TestCase):
         def broken():
             raise RuntimeError("down")
         sources = {"broken": broken, "ok": lambda: [make_job()]}
-        summary = pipeline.run_once(sources, self.store, FakeAI(), FakeGmail(), "role")
+        summary = pipeline.run_once(sources, self.store, FakeAI(), FakeGmail(), ROLES)
         self.assertEqual(summary.source_errors, ["broken"])
         self.assertEqual(self.store.get("arbeitnow:1")["status"], MATCHED)
 
@@ -390,7 +395,7 @@ class PipelineTest(unittest.TestCase):
             raise RuntimeError("down")
         gmail = FakeGmail()
         for _ in range(8):
-            pipeline.run_once({"broken": broken}, self.store, FakeAI(), gmail, "role")
+            pipeline.run_once({"broken": broken}, self.store, FakeAI(), gmail, ROLES)
         self.assertEqual(len([mail for mail in gmail.sent if "failed" in mail[0]]), 1)
 
     def test_arbeitnow_fetch_is_throttled(self):
@@ -620,6 +625,36 @@ class WebAppTest(unittest.TestCase):
         self.post("/status", {"job_id": "arbeitnow:1", "status": "applied", "view": "review"})
         self.assertIn("Back to review", self.get("/?view=active").text)
 
+    def test_long_location_lists_are_shortened_in_the_row(self):
+        self.assertEqual(web.short_location("Berlin; Paris; Rome; Oslo; Lisbon"), "Berlin; Paris; Rome and 2 more")
+        self.assertEqual(web.short_location("Berlin; Paris; Rome; Oslo"), "Berlin; Paris; Rome; Oslo")
+
+    def test_interviewing_has_its_own_tab(self):
+        self.post("/status", {"job_id": "arbeitnow:1", "status": "interviewing", "view": "review"})
+        self.assertIn("GTM Engineer", self.get("/?view=interviewing").text)
+        self.assertNotIn("GTM Engineer", self.get("/?view=active").text)
+        self.assertIn("Interviewing (1)</a>", self.get().text)
+
+    def test_search_covers_every_tab_by_title_and_company(self):
+        self.post("/status", {"job_id": "arbeitnow:1", "status": "rejected", "view": "review"})
+        page = self.get("/?q=engineer").text
+        # A rejected match and a filtered-out job both appear.
+        self.assertIn("GTM Engineer &lt;script&gt;", page)
+        self.assertIn("Revenue Operations Engineer", page)
+        self.assertIn("2 jobs with &ldquo;engineer&rdquo;", page)
+        self.assertIn("<span class=state>Filtered out</span>", page)
+        by_company = self.get("/?q=BETA").text
+        self.assertIn("Revenue Operations Engineer", by_company)
+        self.assertNotIn("GTM Engineer", by_company)
+        # LIKE wildcards are searched for literally.
+        self.assertIn("No matching jobs.", self.get("/?q=%25").text)
+
+    def test_changing_status_from_search_returns_to_the_results(self):
+        page = self.get("/?q=gtm").text
+        self.assertIn('name="q" value="gtm"', page)
+        response = self.post("/status", {"job_id": "arbeitnow:1", "status": "applied", "view": "review", "q": "gtm"})
+        self.assertEqual(response.headers["Location"], "/?view=review&q=gtm#job-arbeitnow-1")
+
     def test_notes_are_saved(self):
         response = self.post("/notes", {"job_id": "arbeitnow:1", "notes": "Sent CV", "view": "review"})
         self.assertEqual(response.headers["Location"], "/?view=review#job-arbeitnow-1-detail")
@@ -767,7 +802,7 @@ class TrackManualJobTest(unittest.TestCase):
         self.store = Store(":memory:")
 
     def test_new_job_is_assessed_and_put_in_review_without_an_email(self):
-        job_id, already = pipeline.track_manual_job(make_job(source="manual"), self.store, FakeAI(), "role")
+        job_id, already = pipeline.track_manual_job(make_job(source="manual"), self.store, FakeAI(), ROLES)
         row = self.store.get(job_id)
         self.assertFalse(already)
         self.assertEqual((row["status"], row["application_status"], row["fit_score"], row["filter_reason"]), (MATCHED, "to review", 80, None))
@@ -775,26 +810,26 @@ class TrackManualJobTest(unittest.TestCase):
 
     def test_ai_concern_is_kept_as_a_warning(self):
         ai = FakeAI(assessment(language_requirement="required"))
-        job_id, _ = pipeline.track_manual_job(make_job(source="manual"), self.store, ai, "role")
+        job_id, _ = pipeline.track_manual_job(make_job(source="manual"), self.store, ai, ROLES)
         self.assertEqual((self.store.get(job_id)["status"], self.store.get(job_id)["filter_reason"]), (MATCHED, "Requires German above a basic level"))
 
     def test_same_link_already_tracked_is_reused(self):
         self.store.add(make_job())
         self.store.save_assessment("arbeitnow:1", assessment(), None)
-        job_id, already = pipeline.track_manual_job(make_job(source="manual", url="https://example.com/arbeitnow/1"), self.store, FakeAI(), "role")
+        job_id, already = pipeline.track_manual_job(make_job(source="manual", url="https://example.com/arbeitnow/1"), self.store, FakeAI(), ROLES)
         self.assertEqual((job_id, already), ("arbeitnow:1", True))
 
     def test_filtered_out_job_moves_to_review_with_its_reason(self):
         self.store.add(make_job())
         self.store.save_assessment("arbeitnow:1", assessment(), "Requires German above a basic level")
         ai = FakeAI()
-        job_id, already = pipeline.track_manual_job(make_job(source="manual", native_id="x"), self.store, ai, "role")
+        job_id, already = pipeline.track_manual_job(make_job(source="manual", native_id="x"), self.store, ai, ROLES)
         row = self.store.get(job_id)
         self.assertEqual((job_id, already, row["status"], row["filter_reason"]), ("arbeitnow:1", False, MATCHED, "Requires German above a basic level"))
         self.assertEqual(ai.assessed, [])
 
     def test_ai_failure_still_tracks_the_job(self):
-        job_id, _ = pipeline.track_manual_job(make_job(source="manual"), self.store, FakeAI(error=AIError("down")), "role")
+        job_id, _ = pipeline.track_manual_job(make_job(source="manual"), self.store, FakeAI(error=AIError("down")), ROLES)
         row = self.store.get(job_id)
         self.assertEqual((row["status"], row["fit_score"]), (MATCHED, None))
 
@@ -896,6 +931,70 @@ class ApplicationEmailTest(unittest.TestCase):
         self.assertNotIn("<b>Your application</b>", html)
 
 
+class RecordingAI(FakeAI):
+    def __init__(self, track):
+        super().__init__(assessment(track=track))
+        self.offered = []
+
+    def assess_job(self, job, target_roles):
+        self.offered.append(sorted(target_roles))
+        return super().assess_job(job, target_roles)
+
+
+TWO_TRACKS = [
+    config.Track("gtm", "GTM CV", Path("gtm.md"), (r"\bgtm\b",)),
+    config.Track("fullstack", "Full Stack CV", Path("fs.md"), (r"full[\s-]?stack",), min_salary=65000),
+]
+TWO_ROLES = {"gtm": "GTM role", "fullstack": "Full stack role"}
+
+
+class TrackTest(unittest.TestCase):
+    def setUp(self):
+        title_res = {track.key: re.compile("|".join(track.title_patterns), re.IGNORECASE) for track in TWO_TRACKS}
+        by_key = {track.key: track for track in TWO_TRACKS}
+        excluded = {"gtm": re.compile(r"(?!x)x"), "fullstack": re.compile(r"\bsenior\b", re.IGNORECASE)}
+        for target, name, value in [(filters, "TRACK_TITLE_RES", title_res), (filters, "TRACKS_BY_KEY", by_key), (filters, "TRACK_EXCLUDED_RES", excluded),
+                                    (notify, "TRACKS", TWO_TRACKS), (notify, "TRACKS_BY_KEY", by_key),
+                                    (web, "TRACKS", TWO_TRACKS), (web, "TRACKS_BY_KEY", by_key)]:
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.store = Store(":memory:")
+
+    def test_title_is_matched_to_its_track(self):
+        self.assertEqual(filters.matching_tracks("Full Stack Engineer (Mid-Level)"), ["fullstack"])
+        self.assertEqual(filters.matching_tracks("GTM Engineer"), ["gtm"])
+        self.assertEqual(filters.matching_tracks("Werkstudent Full Stack"), [])
+
+    def test_a_track_can_skip_titles_another_track_keeps(self):
+        self.assertEqual(filters.matching_tracks("Senior Full Stack Engineer GTM"), ["gtm"])
+        self.assertEqual(filters.matching_tracks("Full Stack Engineer"), ["fullstack"])
+
+    def test_ai_sees_only_matching_tracks_and_the_choice_is_saved(self):
+        ai = RecordingAI("fullstack")
+        self.store.add(make_job(title="Full Stack Engineer"))
+        pipeline.assess_pending(self.store, ai, TWO_ROLES, pipeline.RunSummary())
+        self.assertEqual(ai.offered, [["fullstack"]])
+        self.assertEqual(self.store.get("arbeitnow:1")["track"], "fullstack")
+
+    def test_pasted_job_is_offered_every_track(self):
+        ai = RecordingAI("gtm")
+        job_id, _ = pipeline.track_manual_job(make_job(source="manual", title="Engineer"), self.store, ai, TWO_ROLES)
+        self.assertEqual(ai.offered, [["fullstack", "gtm"]])
+        self.assertEqual(self.store.get(job_id)["track"], "gtm")
+
+    def test_each_track_uses_its_own_salary_floor(self):
+        self.assertIn("62,000", filters.hard_requirement_failure(assessment(track="fullstack", salary_max_per_year=62000)))
+        self.assertIsNone(filters.hard_requirement_failure(assessment(track="gtm", salary_max_per_year=62000)))
+
+    def test_cv_label_is_shown_in_the_email_and_tracker(self):
+        self.store.add(make_job(title="Full Stack Engineer"))
+        self.store.save_assessment("arbeitnow:1", assessment(track="fullstack"), None)
+        job = self.store.get("arbeitnow:1")
+        self.assertIn("Full Stack CV", notify.build_digest([job], None, [])[2])
+        self.assertIn('<span class="cv">Full Stack CV</span>', web.render_job(job, "review"))
+
+
 class StoreMigrationTest(unittest.TestCase):
     def test_existing_database_gets_the_new_columns(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -924,11 +1023,111 @@ class OpenAIParsingTest(unittest.TestCase):
 
 
 class SchedulingTest(unittest.TestCase):
-    def test_active_hours(self):
-        self.assertTrue(within_active_hours(datetime(2026, 11, 9, 7, 0)))
-        self.assertTrue(within_active_hours(datetime(2026, 11, 9, 20, 59)))
-        self.assertFalse(within_active_hours(datetime(2026, 11, 9, 21, 0)))
-        self.assertFalse(within_active_hours(datetime(2026, 11, 9, 6, 59)))
+    def test_run_hours(self):
+        self.assertEqual(config.RUN_HOURS, [8, 13, 18])
+        self.assertTrue(is_run_hour(datetime(2026, 11, 9, 8, 0)))
+        self.assertTrue(is_run_hour(datetime(2026, 11, 9, 13, 59)))
+        self.assertFalse(is_run_hour(datetime(2026, 11, 9, 9, 0)))
+        self.assertFalse(is_run_hour(datetime(2026, 11, 9, 7, 59)))
+
+
+class FakeResponsesSession:
+    """Stands in for requests.Session, returning one completed Responses API reply with token usage."""
+
+    def __init__(self, result: dict, usage: dict):
+        self.bodies = []
+        self.reply = {
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(result)}]}],
+            "usage": usage,
+        }
+
+    def post(self, url, headers, json, timeout):
+        self.bodies.append(json)
+        return mock.Mock(status_code=200, json=lambda: self.reply)
+
+
+class OpenAIClientTest(unittest.TestCase):
+    USAGE = {
+        "input_tokens": 3000, "input_tokens_details": {"cached_tokens": 2048},
+        "output_tokens": 300, "output_tokens_details": {"reasoning_tokens": 100},
+    }
+
+    def test_assessment_cache_key_names_the_tracks_sent(self):
+        session = FakeResponsesSession(assessment(track="gtm"), self.USAGE)
+        client = OpenAIClient("key", "model", session)
+        with self.assertLogs(level="INFO") as logs:
+            client.assess_job(make_job().__dict__ | {"remote": False}, {"gtm": "role", "fullstack": "other"})
+        body = session.bodies[0]
+        self.assertEqual(body["prompt_cache_key"], "jobbot:job_assessment:gtm+fullstack")
+        # The job comes last, so every call for the same tracks starts with the same text.
+        self.assertIn("role", body["input"][0]["content"])
+        self.assertIn("GTM Engineer", body["input"][1]["content"])
+        self.assertIn("3000 input tokens (2048 cached), 300 output tokens (100 reasoning)", logs.output[0])
+
+    def test_usage_totals_per_call_type(self):
+        session = FakeResponsesSession({"same_role": True}, self.USAGE)
+        client = OpenAIClient("key", "model", session)
+        listing = {"title": "GTM Engineer", "company": "Acme", "location": "Berlin", "description": "Job."}
+        with self.assertLogs(level="INFO") as logs:
+            client.same_role(listing, listing)
+            client.same_role(listing, listing)
+            client.log_usage()
+        self.assertEqual(session.bodies[0]["prompt_cache_key"], "jobbot:same_role")
+        self.assertEqual(client.usage["same_role"], {"calls": 2, "input": 6000, "cached": 4096, "output": 600, "reasoning": 200})
+        self.assertIn("AI usage same_role: 2 calls, 6000 input tokens (4096 cached), 600 output tokens (200 reasoning)", logs.output[-1])
+
+
+TECHTREE_LISTING = (
+    'queries:$R[20]=[$R[21]={state:$R[22]={data:$R[23]=['
+    '$R[24]={id:"7178b365-531a-44f8-8f83-4dcfd7dbea9e",title:"GTM Engineer",organization:"TechTree\'s client",'
+    'company:$R[25]={slug:"org-1",displayName:"AI platform for \\"sales\\" teams",isAnonymized:!0,tagline:"x"},'
+    'deliveryOwner:$R[26]={name:"someone"},location:"Berlin, Germany",locations:$R[27]=[$R[28]={id:"debc2be6-34d8-4c94-99a9-cfb38dc6699e",'
+    'location:"Berlin, Germany",workplaceType:"Hybrid"}],description:"Build AI workflows \\x3Cfor\\x3E sales.",'
+    'shortDescription:"Short.",postedDateRaw:"2026-11-16T12:54:06.600468",workplaceType:"Hybrid"},'
+    '$R[30]={id:"e0fabd11-c43f-4fd5-8dc7-8d51d1195505",title:"RevOps Engineer",organization:"Acme",'
+    'company:$R[31]={slug:"acme",displayName:"Acme",isAnonymized:!1},location:"North America (remote)",'
+    'locations:$R[32]=[$R[33]={id:"aaaaaaaa-34d8-4c94-99a9-cfb38dc6699e",location:"North America (remote)",workplaceType:"Remote"}],'
+    'description:"Remote.",postedDateRaw:"2026-11-16T10:00:00",workplaceType:"Remote"}]}}]'
+)
+
+
+class TechTreeTest(unittest.TestCase):
+    def test_listing_is_parsed_from_the_embedded_data(self):
+        first, second = techtree.parse_listing(TECHTREE_LISTING)
+        self.assertEqual(first.job_id, "techtree:7178b365-531a-44f8-8f83-4dcfd7dbea9e")
+        self.assertEqual(first.title, "GTM Engineer")
+        # An anonymised client is named by its description.
+        self.assertEqual(first.company, 'AI platform for "sales" teams')
+        self.assertEqual(first.location, "Berlin, Germany")
+        self.assertEqual(first.description, "Build AI workflows <for> sales.")
+        self.assertEqual(first.posted_at, "2026-11-16T12:54:06.600468+00:00")
+        self.assertEqual(first.url, "https://jobs.techtree.dev/job/7178b365-531a-44f8-8f83-4dcfd7dbea9e")
+        self.assertFalse(first.remote)
+        self.assertEqual(second.company, "Acme")
+        # Remote, but not from the profile's regions.
+        self.assertFalse(second.remote)
+
+    def test_detail_page_gives_the_full_description(self):
+        page = TECHTREE_LISTING.replace('shortDescription:"Short."', 'shortDescription:"Short.",detailedDescription:"\\x3Cp>Full text\\x3C/p>"')
+        self.assertEqual(techtree.parse_detail(page, "7178b365-531a-44f8-8f83-4dcfd7dbea9e"), "Full text")
+
+    def test_only_new_jobs_that_pass_the_rules_cost_a_second_request(self):
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")[:19]
+        listing = TECHTREE_LISTING.replace("2026-11-16T12:54:06.600468", now).replace("2026-11-16T10:00:00", now)
+        detail = listing.replace('shortDescription:"Short."', 'shortDescription:"Short.",detailedDescription:"Full text"')
+        session = mock.Mock()
+        session.get.side_effect = [mock.Mock(text=listing, raise_for_status=lambda: None), mock.Mock(text=detail, raise_for_status=lambda: None)]
+        with mock.patch.object(techtree.time, "sleep"), self.assertLogs("jobbot", level="INFO"):
+            jobs = techtree.fetch_techtree(session, is_known=lambda job_id: False)
+        self.assertEqual([job.title for job in jobs], ["GTM Engineer"])
+        self.assertEqual(jobs[0].description, "Full text")
+        self.assertEqual(session.get.call_count, 2)
+        session.get.reset_mock(side_effect=True)
+        session.get.side_effect = [mock.Mock(text=listing, raise_for_status=lambda: None)]
+        with self.assertLogs("jobbot", level="INFO"):
+            techtree.fetch_techtree(session, is_known=lambda job_id: True)
+        self.assertEqual(session.get.call_count, 1)
 
 
 if __name__ == "__main__":

@@ -14,21 +14,23 @@ from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
 from jobbot import pipeline
 from jobbot.ai import AIError, OpenAIClient
-from jobbot.config import APP_URL, DATABASE, TARGET_ROLE_FILE, TIMEZONE, WEB_PORT, load_settings
+from jobbot.config import APP_URL, DATABASE, TIMEZONE, TRACKS, TRACKS_BY_KEY, WEB_PORT, load_settings, load_target_roles
 from jobbot.notify import posted_label, source_name
 from jobbot.sources import manual, public
-from jobbot.store import APPLICATION_STATUSES, TO_REVIEW, Store
+from jobbot.store import APPLICATION_STATUSES, FILTERED_OUT, TO_REVIEW, Store
 
 log = logging.getLogger("jobbot")
 
 MAX_BODY_BYTES = 200_000
 MAX_NOTES_CHARS = 5_000
 FILTERED_LIMIT = 200
+SEARCH_LIMIT = 200
+MAX_SEARCH_CHARS = 100
 
 NOTICES = {
     "added": ("ok", "Job added. Its details are open below."),
@@ -47,7 +49,8 @@ NEEDS_TEXT = {"closed_site", "fetch_failed", "not_a_job"}
 # Each tab shows matches with these application statuses. "filtered" lists what the AI rejected.
 VIEWS = {
     "review": ("To review", ["to review"]),
-    "active": ("Applied", ["applied", "interviewing"]),
+    "active": ("Applied", ["applied"]),
+    "interviewing": ("Interviewing", ["interviewing"]),
     "closed": ("Closed", ["rejected", "not interested"]),
     "filtered": ("Filtered out", []),
 }
@@ -72,11 +75,19 @@ body { margin: 0; background: var(--page); color: var(--ink);
   font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 main { max-width: 1240px; margin: 0 auto; padding: 24px 16px 48px; }
 h1 { font-size: 22px; margin: 0 0 16px; }
-nav { display: flex; gap: 6px; margin: 0 -16px 18px; padding: 0 16px; overflow-x: auto; scrollbar-width: none; }
+.toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+nav { display: flex; gap: 6px; margin: 0 -16px; padding: 0 16px; overflow-x: auto; scrollbar-width: none; flex: 1; min-width: 0; }
 nav::-webkit-scrollbar { display: none; }
 nav a { flex: none; padding: 7px 12px; border-radius: 999px; text-decoration: none; color: var(--muted);
   border: 1px solid var(--line); font-size: 14px; white-space: nowrap; }
 nav a[aria-current="page"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.search { flex: none; width: 260px; }
+.search input { width: 100%; font: inherit; color: var(--ink); background: var(--card); border: 1px solid var(--line);
+  border-radius: 999px; padding: 7px 14px; }
+.results { margin: 0 0 12px; color: var(--muted); }
+.results a { color: var(--ink); }
+.state { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--grey-bg);
+  color: var(--grey); margin-bottom: 6px; white-space: nowrap; }
 
 table { width: 100%; border-collapse: separate; border-spacing: 0; background: var(--card);
   border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
@@ -99,10 +110,13 @@ tbody.job.open .toggle { transform: rotate(90deg); }
 .title { font-weight: 600; color: var(--ink); text-decoration: none; overflow-wrap: anywhere; }
 .title:hover { text-decoration: underline; }
 .company { color: var(--muted); margin-top: 1px; }
-.location { max-width: 200px; overflow-wrap: anywhere; }
+/* The minimum keeps short places like "Berlin/Remote" on one line, while long ones can still wrap. */
+.location { min-width: 110px; max-width: 200px; overflow-wrap: anywhere; }
 .nowrap { white-space: nowrap; }
 .muted { color: var(--muted); }
 .mobile-meta { display: none; }
+.cv { display: inline-block; margin-left: 8px; font-size: 11px; padding: 1px 7px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--muted); vertical-align: 1px; white-space: nowrap; }
 .has-notes { display: inline-block; margin-left: 6px; font-size: 11px; padding: 1px 6px; border-radius: 999px;
   background: var(--grey-bg); color: var(--grey); vertical-align: 1px; }
 
@@ -113,7 +127,9 @@ button:hover { border-color: var(--muted); }
 .actions button.current { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 .actions button.undo { border-color: transparent; color: var(--muted); padding: 4px 4px; }
 .reason { max-width: 340px; }
-@media (min-width: 1100px) { .actions { flex-wrap: nowrap; } }
+/* Room for the four status buttons: two rows of two at medium widths, and one row on wide screens. */
+@media (min-width: 1101px) { td.status { min-width: 236px; } }
+@media (min-width: 1200px) { td.status { min-width: 380px; } }
 
 tr.detail td { padding: 0; border-top: 0; }
 .panel { background: var(--panel); border-top: 1px dashed var(--line); padding: 16px 16px 18px 64px;
@@ -147,7 +163,9 @@ details.saved summary { cursor: pointer; color: var(--muted); }
 .notice.error { background: var(--amber-bg); color: var(--amber); border-color: transparent; }
 .warning { margin-top: 4px; font-size: 12px; color: var(--amber); }
 
-@media (max-width: 760px) {
+@media (max-width: 1100px) {
+  .toolbar { flex-direction: column-reverse; align-items: stretch; }
+  .search { width: auto; }
   table, tbody, tr, td { display: block; }
   thead { display: none; }
   table { border-radius: 12px; }
@@ -204,6 +222,13 @@ def _anchor(job_id: str) -> str:
     return "job-" + "".join(char if char.isalnum() else "-" for char in job_id)
 
 
+def cv_label(job: dict) -> str:
+    """The CV to send for this job: its track's label. Empty when the profile has only one track."""
+    if len(TRACKS) < 2:
+        return ""
+    return (TRACKS_BY_KEY.get(job.get("track") or "") or TRACKS[0]).label
+
+
 def _date(iso: str) -> str:
     """'10 Nov 2026, 14:05' in the profile's timezone, or the raw value if it is only a date."""
     if not iso:
@@ -223,7 +248,15 @@ def _list(items: list[str], empty: str) -> str:
     return "<ul>" + "".join(f"<li>{escape(item)}</li>" for item in items) + "</ul>"
 
 
-def _status_form(job: dict, view: str) -> str:
+def _hidden(job: dict, view: str, query: str) -> str:
+    """The fields every job form sends, so the server can return to the same tab or search."""
+    fields = f'<input type="hidden" name="job_id" value="{escape(job["job_id"], quote=True)}"><input type="hidden" name="view" value="{view}">'
+    if query:
+        fields += f'<input type="hidden" name="q" value="{escape(query, quote=True)}">'
+    return fields
+
+
+def _status_form(job: dict, view: str, query: str = "") -> str:
     # One button per action, so a single click saves. The current status is highlighted.
     current = job["application_status"]
     buttons = "".join(
@@ -235,12 +268,11 @@ def _status_form(job: dict, view: str) -> str:
         buttons += f'<button type="submit" name="status" value="{TO_REVIEW}" class="undo">Back to review</button>'
     return (
         f'<form class="actions" method="post" action="/status" aria-label="Status">'
-        f'<input type="hidden" name="job_id" value="{escape(job["job_id"], quote=True)}"><input type="hidden" name="view" value="{view}">'
-        f"{buttons}</form>"
+        f"{_hidden(job, view, query)}{buttons}</form>"
     )
 
 
-def _panel(job: dict, view: str) -> str:
+def _panel(job: dict, view: str, query: str = "") -> str:
     link = _link(job["url"])
     others = [(href, escape(urlparse(url).netloc.removeprefix("www."))) for url in json.loads(job["other_links"]) if (href := _link(url))]
     links = [f'<a href="{link}" target="_blank" rel="noopener noreferrer">Job posting</a>'] if link else []
@@ -256,7 +288,8 @@ def _panel(job: dict, view: str) -> str:
         f'<section><h3>Unknowns</h3>{_list(json.loads(job["unknowns"]), "None noted.")}</section>',
         '<section><h3>Details</h3><dl>'
         f'<dt>Company</dt><dd>{escape(job["company"])}</dd>'
-        f'<dt>Location</dt><dd>{escape(job["location"] or "Not stated")}</dd>'
+        + (f"<dt>CV</dt><dd>{escape(cv_label(job))}</dd>" if cv_label(job) else "")
+        + f'<dt>Location</dt><dd>{escape(job["location"] or "Not stated")}</dd>'
         f'<dt>Source</dt><dd>{escape(source_name(job["source"]))}</dd>'
         f'<dt>Posted</dt><dd>{_date(job["posted_at"]) or "Unknown"}</dd>'
         f'<dt>First seen</dt><dd>{_date(job["first_seen_at"])}</dd>'
@@ -274,7 +307,7 @@ def _panel(job: dict, view: str) -> str:
             '<section class="wide"><h3>Saved posting</h3>'
             '<p class="muted">This source gave only the title. Paste the posting text to keep a copy in case it is taken down.</p>'
             f'<form class="notes-form" method="post" action="/description">'
-            f'<input type="hidden" name="job_id" value="{escape(job["job_id"], quote=True)}"><input type="hidden" name="view" value="{view}">'
+            f"{_hidden(job, view, query)}"
             f'<textarea name="text" maxlength="{manual.MAX_DESCRIPTION_CHARS}" aria-label="Posting text" placeholder="Paste the job posting text"></textarea>'
             '<button type="submit">Save posting</button></form></section>'
         )
@@ -282,62 +315,94 @@ def _panel(job: dict, view: str) -> str:
         sections.append(
             '<section class="wide"><h3>Notes</h3>'
             f'<form class="notes-form" method="post" action="/notes">'
-            f'<input type="hidden" name="job_id" value="{escape(job["job_id"], quote=True)}"><input type="hidden" name="view" value="{view}">'
+            f"{_hidden(job, view, query)}"
             f'<textarea name="notes" maxlength="{MAX_NOTES_CHARS}" aria-label="Notes" placeholder="Add notes">{escape(job["notes"] or "")}</textarea>'
             '<button type="submit">Save notes</button></form></section>'
         )
     return f'<div class="panel">{"".join(sections)}</div>'
 
 
-def render_job(job: dict, view: str) -> str:
+def short_location(location: str, shown: int = 3) -> str:
+    """The first few places of a long list, with a count of the rest. The full list is in the details."""
+    places = [place.strip() for place in location.split(";") if place.strip()]
+    if len(places) <= shown + 1:
+        return location
+    return f"{'; '.join(places[:shown])} and {len(places) - shown} more"
+
+
+def render_job(job: dict, view: str, query: str = "") -> str:
     score = job["fit_score"]
     link = _link(job["url"])
     title = escape(job["title"].strip())
     warning = f'<div class="warning">&#9888; {escape(job["filter_reason"])}</div>' if view != "filtered" and job["filter_reason"] else ""
     title_html = f'<a class="title" href="{link}" target="_blank" rel="noopener noreferrer">{title}</a>' if link else f'<span class="title">{title}</span>'
     notes_badge = '<span class="has-notes">Notes</span>' if job["notes"] else ""
+    cv = cv_label(job)
+    cv_badge = f'<span class="cv">{escape(cv)}</span>' if cv and view != "filtered" else ""
     posted = posted_label(job["posted_at"], datetime.now(timezone.utc))
     source = source_name(job["source"])
-    mobile_meta = " &middot; ".join(escape(part) for part in (job["location"], posted, source) if part)
+    location = short_location(job["location"])
+    mobile_meta = " &middot; ".join(escape(part) for part in (location, posted, source) if part)
     anchor = _anchor(job["job_id"])
     last = (
-        f'<td class="reason">{escape(job["filter_reason"] or "")}</td>' if view == "filtered"
-        else f'<td class="status">{_status_form(job, view)}</td>'
+        f'<td class="reason">{"<span class=state>Filtered out</span><br>" if query else ""}{escape(job["filter_reason"] or "")}</td>' if view == "filtered"
+        else f'<td class="status">{_status_form(job, view, query)}</td>'
     )
     return (
         f'<tbody class="job" id="{anchor}">'
         f'<tr class="row">'
         f'<td><button type="button" class="toggle" aria-expanded="false" aria-controls="{anchor}-detail" aria-label="Show details"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5"/></svg></button></td>'
         f'<td><div class="score {_score_class(score or 0)}" title="Fit score">{"&ndash;" if score is None else score}</div></td>'
-        f'<td class="role">{title_html}{notes_badge}<div class="company">{escape(job["company"])}</div>{warning}<div class="mobile-meta">{mobile_meta}</div></td>'
-        f'<td class="location hide-mobile">{escape(job["location"])}</td>'
+        f'<td class="role">{title_html}{notes_badge}<div class="company">{escape(job["company"])}{cv_badge}</div>{warning}<div class="mobile-meta">{mobile_meta}</div></td>'
+        f'<td class="location hide-mobile">{escape(location)}</td>'
         f'<td class="nowrap hide-mobile">{escape(posted) or "<span class=muted>Unknown</span>"}</td>'
         f'<td class="nowrap hide-mobile">{escape(source)}</td>'
         f"{last}</tr>"
-        f'<tr class="detail" id="{anchor}-detail" hidden><td colspan="7">{_panel(job, view)}</td></tr>'
+        f'<tr class="detail" id="{anchor}-detail" hidden><td colspan="7">{_panel(job, view, query)}</td></tr>'
         "</tbody>"
     )
 
 
-def render_page(store: Store, view: str, nonce: str, notice: str = "", pasted_url: str = "") -> str:
+def _job_view(job: dict) -> str:
+    """The tab a job belongs to."""
+    return "filtered" if job["status"] == FILTERED_OUT else _view_for(job["application_status"])
+
+
+def render_page(store: Store, view: str, nonce: str, notice: str = "", pasted_url: str = "", query: str = "") -> str:
     counts = store.count_matches()
     tabs = []
     for key, (label, statuses) in VIEWS.items():
         count = f" ({sum(counts.get(status, 0) for status in statuses)})" if statuses else ""
-        current = ' aria-current="page"' if key == view else ""
+        current = ' aria-current="page"' if key == view and not query else ""
         tabs.append(f'<a href="/?view={key}"{current}>{escape(label)}{count}</a>')
-    label, statuses = VIEWS[view]
-    jobs = store.filtered_out(FILTERED_LIMIT) if view == "filtered" else store.matches(statuses)
-    last_header = "Reason" if view == "filtered" else "Status"
+    if query:
+        # Search covers every tab, so each row keeps the controls of the tab it belongs to.
+        jobs = store.search(query, SEARCH_LIMIT)
+        rows = [render_job(job, _job_view(job), query) for job in jobs]
+        last_header = "Status"
+        found = f"{len(jobs)} job{'' if len(jobs) == 1 else 's'}" if len(jobs) < SEARCH_LIMIT else f"The newest {SEARCH_LIMIT} jobs"
+        intro = f'<p class="results">{found} with &ldquo;{escape(query)}&rdquo; in the title or company. <a href="/?view={view}">Clear search</a></p>'
+    else:
+        _, statuses = VIEWS[view]
+        jobs = store.filtered_out(FILTERED_LIMIT) if view == "filtered" else store.matches(statuses)
+        rows = [render_job(job, view) for job in jobs]
+        last_header = "Reason" if view == "filtered" else "Status"
+        intro = ""
     if jobs:
-        body = (
+        body = intro + (
             '<table><thead><tr><th aria-label="Expand"></th><th>Fit</th><th>Role</th><th>Location</th><th>Posted</th>'
             f'<th>Source</th><th>{last_header}</th></tr></thead>'
-            + "".join(render_job(job, view) for job in jobs)
+            + "".join(rows)
             + "</table>"
         )
     else:
-        body = '<p class="empty">Nothing here yet.</p>'
+        body = intro + f'<p class="empty">{"No matching jobs." if query else "Nothing here yet."}</p>'
+    search = (
+        '<form class="search" method="get" action="/" role="search">'
+        f'<input type="hidden" name="view" value="{view}">'
+        f'<input type="search" name="q" value="{escape(query, quote=True)}" maxlength="{MAX_SEARCH_CHARS}" '
+        'placeholder="Search titles and companies" aria-label="Search titles and companies"></form>'
+    )
     notice_html = ""
     if notice in NOTICES:
         kind, text = NOTICES[notice]
@@ -355,7 +420,7 @@ def render_page(store: Store, view: str, nonce: str, notice: str = "", pasted_ur
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         '<meta name="robots" content="noindex, nofollow">'
         f"<title>Job Tracker</title><style>{CSS}</style></head>"
-        f'<body><main><h1>Job Tracker</h1>{add_form}{notice_html}<nav aria-label="Views">{"".join(tabs)}</nav>{body}</main>'
+        f'<body><main><h1>Job Tracker</h1>{add_form}{notice_html}<div class="toolbar"><nav aria-label="Views">{"".join(tabs)}</nav>{search}</div>{body}</main>'
         f'<script nonce="{nonce}">{SCRIPT}</script></body></html>'
     )
 
@@ -413,7 +478,8 @@ class Handler(BaseHTTPRequestHandler):
         nonce = secrets.token_urlsafe(16)
         notice = (query.get("notice") or [""])[0]
         pasted_url = (query.get("url") or [""])[0][:2000]
-        self._send(HTTPStatus.OK, render_page(Store(self.database), view, nonce, notice, pasted_url), nonce=nonce)
+        search = (query.get("q") or [""])[0].strip()[:MAX_SEARCH_CHARS]
+        self._send(HTTPStatus.OK, render_page(Store(self.database), view, nonce, notice, pasted_url, search), nonce=nonce)
 
     def do_POST(self) -> None:
         # Browsers send Origin on form posts. Checking it stops another site from submitting forms here.
@@ -449,14 +515,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         # Stay on the same tab. A job whose status moved it to another tab simply disappears from this one.
         fragment = _anchor(job_id) + ("-detail" if self.path in ("/notes", "/description") else "")
-        self._send(HTTPStatus.SEE_OTHER, headers={"Location": f"/?view={quote(view)}#{fragment}"})
+        search = form.get("q", "").strip()[:MAX_SEARCH_CHARS]
+        params = {"view": view, "q": search} if search else {"view": view}
+        self._send(HTTPStatus.SEE_OTHER, headers={"Location": f"/?{urlencode(params)}#{fragment}"})
 
 
     def _add_job(self, store: Store, form: dict) -> None:
         ai = self.make_ai()
         try:
             job = manual.build_job(form.get("url", ""), form.get("text", ""), self.make_session(), ai)
-            job_id, already = pipeline.track_manual_job(job, store, ai, TARGET_ROLE_FILE.read_text(encoding="utf-8"))
+            job_id, already = pipeline.track_manual_job(job, store, ai, load_target_roles())
         except manual.ManualJobError as error:
             url = quote(form.get("url", "")[:2000], safe="")
             self._send(HTTPStatus.SEE_OTHER, headers={"Location": f"/?view=review&notice={error.code}&url={url}"})

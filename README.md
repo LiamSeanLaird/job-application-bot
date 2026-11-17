@@ -1,7 +1,7 @@
 # Job application bot
 
 A personal job search assistant that runs on a small server.
-Every 30 minutes during the day it collects new postings from several sources, removes duplicates and reposts, and asks an AI model whether each job fits the role you described.
+At the hours you choose, by default 3 times a day, it collects new postings from several sources, removes duplicates and reposts, and asks an AI model whether each job fits the role you described.
 It emails you new matches, and a small web app lets you track each application, add jobs by pasting a link, and keep a copy of every posting in case it is taken down.
 
 You review every job and apply yourself.
@@ -22,7 +22,7 @@ flowchart TD
     S --> N[Email to you]
 ```
 
-1. **Collect.** Sources are switched on in your profile: Arbeitnow, Berlin Startup Jobs, JSearch (Google for Jobs), public careers feeds of a list of companies, and the job alert emails LinkedIn, Indeed, StepStone and XING send to your Gmail.
+1. **Collect.** Sources are switched on in your profile: Arbeitnow, Berlin Startup Jobs, TechTree, JSearch (Google for Jobs), public careers feeds of a list of companies, and the job alert emails LinkedIn, Indeed, StepStone and XING send to your Gmail.
 2. **Rules.** Cheap checks keep jobs whose title matches your patterns, in your area or remote, and recent enough.
 3. **Duplicates.** The same job often appears on several sites. Exact matches merge automatically, and likely reposts are confirmed by the AI. A duplicate adds its link to the original and never sends a second email.
 4. **Fit check.** The AI reads the posting and your target role document, and returns a decision, a fit score, reasons, gaps and unknowns.
@@ -34,7 +34,7 @@ flowchart TD
 
 These are built in and should stay that way:
 
-- The bot never visits or automates LinkedIn, Indeed, StepStone, XING or other sites whose terms prohibit it. It reads only the alert emails those sites send you, and for pasted links from them it asks you to paste the job text.
+- The bot never visits or automates LinkedIn, Indeed, StepStone or XING. It reads only the alert emails those sites send you, and for pasted links from them it asks you to paste the job text.
 - It never fakes its identity, solves CAPTCHAs or evades bot detection, and it backs off when a site asks it to slow down.
 - It sends email only to the owner address in your profile, and never replies to anyone.
 - Job postings and emails are untrusted text. AI calls return JSON in a fixed schema with no tools, so a posting cannot make the bot act.
@@ -54,6 +54,11 @@ cp -r profile.example profile
 
 - `profile/settings.toml` holds your owner email, timezone, search area, title patterns, limits and sources. Every setting is explained in the file.
 - `profile/target_role.md` describes the job you want, your background, your gaps and the screening rules. The AI reads all of it for every fit check, so specific is better.
+  Keep it to what screening needs: anything else, such as CV writing notes, is sent with every job and costs tokens. Put those in a separate file the bot does not read.
+
+To search for more than one kind of job, add a `[[tracks]]` block per category in `settings.toml`, each with its own title patterns, JSearch queries, target role document and CV label.
+The AI checks each job against the tracks its title matches, or all of them for pasted links and alert emails, and picks the best fit.
+The tracker and emails then show which CV to send, and a track can set its own salary floor.
 
 Git ignores `profile/`, so your details never end up in the repository.
 
@@ -103,6 +108,7 @@ Set `DEPLOY_HOST` in `.env`, then run:
 The first deploy generates a web app password in `.env`, and uses a free [sslip.io](https://sslip.io) hostname made from the server's IP unless you set `APP_HOSTNAME`.
 It leaves other apps' crontab entries and nginx sites untouched.
 The bot uses about 20 MB of memory for the web app, plus a short burst during each run.
+Each run logs the OpenAI tokens it used per call type to `data/jobbot.log`, including how many were served from OpenAI's prompt cache at a lower price.
 
 ## Project layout
 

@@ -13,22 +13,23 @@ from zoneinfo import ZoneInfo
 from jobbot import application_emails, notify, pipeline, web
 from jobbot.ai import OpenAIClient
 from jobbot.config import (
-    ACTIVE_HOURS,
     APP_URL,
     ARBEITNOW_ENABLED,
     BERLIN_STARTUP_JOBS_ENABLED,
     DATA_DIR,
     DATABASE,
     GMAIL_ALERTS_ENABLED,
+    TECHTREE_ENABLED,
     TRACK_APPLICATION_EMAILS,
     JSEARCH_QUERIES,
     LOG_FILE,
-    TARGET_ROLE_FILE,
+    RUN_HOURS,
     TIMEZONE,
     load_settings,
+    load_target_roles,
 )
 from jobbot.google_api import Gmail, GoogleClient, authorize
-from jobbot.sources import careers, gmail_alerts, jsearch, public
+from jobbot.sources import careers, gmail_alerts, jsearch, public, techtree
 from jobbot.store import Store
 
 
@@ -40,8 +41,8 @@ def configure_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
 
 
-def within_active_hours(now: datetime | None = None) -> bool:
-    return (now or datetime.now(ZoneInfo(TIMEZONE))).hour in ACTIVE_HOURS
+def is_run_hour(now: datetime | None = None) -> bool:
+    return (now or datetime.now(ZoneInfo(TIMEZONE))).hour in RUN_HOURS
 
 
 def public_sources(session, store: Store) -> dict:
@@ -63,6 +64,12 @@ def public_sources(session, store: Store) -> dict:
             store.set_meta("careers_last_fetch", now.isoformat())
             return jobs
         sources["careers"] = fetch_careers
+    if TECHTREE_ENABLED and pipeline.techtree_is_due(store, now):
+        def fetch_techtree():
+            jobs = techtree.fetch_techtree(session, lambda job_id: store.get(job_id) is not None)
+            store.set_meta("techtree_last_fetch", now.isoformat())
+            return jobs
+        sources["techtree"] = fetch_techtree
     return sources
 
 
@@ -82,7 +89,7 @@ def dry_run() -> int:
 
 
 def run(force: bool, backfill_hours: int | None = None) -> int:
-    if not force and not backfill_hours and not within_active_hours():
+    if not force and not backfill_hours and not is_run_hour():
         return 0
     settings = load_settings()
     if not settings.openai_key:
@@ -93,12 +100,16 @@ def run(force: bool, backfill_hours: int | None = None) -> int:
     google = GoogleClient()
     gmail = Gmail(google)
     ai = OpenAIClient(settings.openai_key, settings.openai_model)
-    target_role = TARGET_ROLE_FILE.read_text(encoding="utf-8")
+    target_roles = load_target_roles()
     if backfill_hours:
-        # One-off catch-up: only company feeds, with a longer age limit. Known jobs are not checked or emailed again.
+        # One-off catch-up: only company feeds and TechTree, with a longer age limit. Known jobs are not checked or emailed again.
         feeds = careers.load_feeds()
         sources = {"careers": lambda: careers.fetch_careers(public.make_session(), feeds, backfill_hours)}
-        pipeline.run_once(sources, store, ai, gmail, target_role, backfill_hours)
+        if TECHTREE_ENABLED:
+            known = lambda job_id: store.get(job_id) is not None
+            sources["techtree"] = lambda: techtree.fetch_techtree(public.make_session(), known, backfill_hours)
+        pipeline.run_once(sources, store, ai, gmail, target_roles, backfill_hours)
+        ai.log_usage()
         return 0
     sources = public_sources(public.make_session(), store)
     if GMAIL_ALERTS_ENABLED:
@@ -110,9 +121,10 @@ def run(force: bool, backfill_hours: int | None = None) -> int:
             store.set_meta("jsearch_last_fetch", now_local.isoformat())
             return found
         sources["jsearch"] = fetch_jsearch
-    pipeline.run_once(sources, store, ai, gmail, target_role)
+    pipeline.run_once(sources, store, ai, gmail, target_roles)
     if TRACK_APPLICATION_EMAILS:
         update_application_statuses(gmail, ai, store)
+    ai.log_usage()
     return 0
 
 
@@ -134,7 +146,7 @@ def main() -> int:
     run_parser = commands.add_parser("run", help="Run one search.")
     run_parser.add_argument("--dry-run", action="store_true", help="Show matches from public sources only.")
     run_parser.add_argument("--force", action="store_true", help="Run outside active hours.")
-    run_parser.add_argument("--backfill-hours", type=int, help="One-off: read only company feeds, keeping jobs up to this many hours old.")
+    run_parser.add_argument("--backfill-hours", type=int, help="One-off: read only company feeds and TechTree, keeping jobs up to this many hours old.")
     args = parser.parse_args()
 
     if args.command == "auth":

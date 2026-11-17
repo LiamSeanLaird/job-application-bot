@@ -54,7 +54,8 @@ RUN="cd $APP_DIR && PYTHONPATH=src .venv/bin/python -m jobbot run >> data/cron.l
 BACKUP="sqlite3 $APP_DIR/data/jobbot.db \".backup '$APP_DIR/data/backups/jobbot-\$(date -u +\\%Y\\%m\\%d).db'\" && find $APP_DIR/data/backups -name 'jobbot-*.db' -mtime +14 -delete"
 {
   crontab -l 2>/dev/null | grep -vF "$MARKER" || true
-  echo "*/30 * * * * flock -n /tmp/jobbot.lock sh -c '$RUN' $MARKER"
+  # Every hour, and the bot skips hours not in run_hours. Checking in the bot's own timezone handles summer time.
+  echo "0 * * * * flock -n /tmp/jobbot.lock sh -c '$RUN' $MARKER"
   echo "25 3 * * * $BACKUP $MARKER"
 } | crontab -
 echo "Scheduled. Current job bot entries:"
